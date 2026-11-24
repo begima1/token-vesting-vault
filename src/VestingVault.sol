@@ -17,23 +17,31 @@ contract VestingVault is Ownable, ReentrancyGuard {
     // ============================================================
     struct Schedule {
         address beneficiary;
-        uint256 total;      // total tokens promised
-        uint256 released;   // tokens already paid out
-        uint64 start;       // unix time when vesting starts
-        uint64 cliff;       // seconds after `start` before ANY token vests
-        uint64 duration;    // seconds after `start` when 100% is vested
-        uint64 revokedAt;   // 0 while not revoked
+        uint256 total; // total tokens promised
+        uint256 released; // tokens already paid out
+        uint64 start; // unix time when vesting starts
+        uint64 cliff; // seconds after `start` before ANY token vests
+        uint64 duration; // seconds after `start` when 100% is vested
+        uint64 revokedAt; // 0 while not revoked
         bool revocable;
         bool revoked;
     }
 
     IERC20 public immutable token;
-    uint256 public scheduleCount;                       // ids start from 1
-    uint256 public totalAllocated;                      // tokens promised to beneficiaries and not yet paid out
+    uint256 public scheduleCount; // ids start from 1
+    uint256 public totalAllocated; // tokens promised to beneficiaries and not yet paid out
     mapping(uint256 => Schedule) public schedules;
     mapping(address => uint256[]) private _schedulesOf;
 
-    event ScheduleCreated(uint256 indexed id, address indexed beneficiary, uint256 amount, uint64 start, uint64 cliff, uint64 duration, bool revocable);
+    event ScheduleCreated(
+        uint256 indexed id,
+        address indexed beneficiary,
+        uint256 amount,
+        uint64 start,
+        uint64 cliff,
+        uint64 duration,
+        bool revocable
+    );
     event Released(uint256 indexed id, address indexed beneficiary, uint256 amount);
     event Revoked(uint256 indexed id, uint256 returnedToOwner);
     event ScheduleTransferred(uint256 indexed id, address indexed from, address indexed to);
@@ -47,15 +55,15 @@ contract VestingVault is Ownable, ReentrancyGuard {
     //  YOUR CODE STARTS HERE
     // ============================================================
 
-    // ------------------------------------------------------------
-    // STEP 1 — create a schedule (owner only)
-    // Validate: beneficiary != 0, amount > 0, duration > 0, cliff <= duration,
-    //   and the vault must hold enough NOT-YET-PROMISED tokens:
-    //   token.balanceOf(address(this)) - totalAllocated >= amount
-    // Then: id = ++scheduleCount, store the Schedule (released = 0, revokedAt = 0, revoked = false),
-    //   remember the id in _schedulesOf[beneficiary], totalAllocated += amount,
-    //   emit ScheduleCreated. Return the id.
-    // ------------------------------------------------------------
+    /// @notice Create a vesting schedule for a beneficiary (owner only).
+    /// @dev The vault must already hold enough tokens that are not promised to anyone else.
+    /// @param beneficiary Address that will receive the vested tokens.
+    /// @param amount Total number of tokens to vest.
+    /// @param start Unix time when vesting starts (may be in the past).
+    /// @param cliff Seconds after `start` during which nothing is vested.
+    /// @param duration Seconds after `start` when everything is vested (must be >= cliff).
+    /// @param revocable Whether the owner may revoke the unvested part later.
+    /// @return id The id of the new schedule (ids start from 1).
     function createSchedule(
         address beneficiary,
         uint256 amount,
@@ -64,68 +72,131 @@ contract VestingVault is Ownable, ReentrancyGuard {
         uint64 duration,
         bool revocable
     ) external onlyOwner returns (uint256 id) {
-        revert("TODO step 1");
+        require(beneficiary != address(0), "zero beneficiary");
+        require(amount > 0, "zero amount");
+        require(duration > 0, "zero duration");
+        require(cliff <= duration, "cliff > duration");
+        require(token.balanceOf(address(this)) >= totalAllocated + amount, "insufficient funds");
+
+        id = ++scheduleCount;
+        schedules[id] = Schedule({
+            beneficiary: beneficiary,
+            total: amount,
+            released: 0,
+            start: start,
+            cliff: cliff,
+            duration: duration,
+            revokedAt: 0,
+            revocable: revocable,
+            revoked: false
+        });
+        _schedulesOf[beneficiary].push(id);
+        totalAllocated += amount;
+        emit ScheduleCreated(id, beneficiary, amount, start, cliff, duration, revocable);
     }
 
-    // ------------------------------------------------------------
-    // STEP 2 — the vesting formula
-    // Let t = block.timestamp, but if the schedule was revoked use s.revokedAt instead.
-    //   t <  start + cliff       -> 0
-    //   t >= start + duration    -> total
-    //   otherwise                -> total * (t - start) / duration     (integer division, rounds down)
-    // vestedAmount(id) reverts for an unknown id. releasable(id) = vestedAmount(id) - released.
-    // ------------------------------------------------------------
+    /// @dev Vesting formula. For a revoked schedule time is frozen at `revokedAt`.
+    ///      Multiplication goes before division to keep precision; the result rounds down.
+    function _vested(Schedule storage s) internal view returns (uint256) {
+        uint256 t = s.revoked ? s.revokedAt : block.timestamp;
+        uint256 start = s.start;
+        if (t < start + s.cliff) return 0;
+        if (t >= start + s.duration) return s.total;
+        return (s.total * (t - start)) / s.duration;
+    }
+
+    /// @notice Amount of tokens vested so far (released or not) for a schedule.
+    /// @param id Schedule id. Reverts if unknown.
+    /// @return Vested amount according to the cliff + linear formula.
     function vestedAmount(uint256 id) public view returns (uint256) {
-        revert("TODO step 2");
+        Schedule storage s = schedules[id];
+        require(s.beneficiary != address(0), "unknown id");
+        return _vested(s);
     }
 
+    /// @notice Amount that can be released right now (vested minus already released).
+    /// @param id Schedule id. Reverts if unknown.
+    /// @return Tokens currently claimable.
     function releasable(uint256 id) public view returns (uint256) {
-        revert("TODO step 2");
+        return vestedAmount(id) - schedules[id].released;
     }
 
-    // ------------------------------------------------------------
-    // STEP 3 — release (ANYONE may call it, tokens always go to the beneficiary)
-    // Reverts if the id is unknown or there is nothing to release.
-    // Order matters: update state FIRST (released, totalAllocated), send tokens LAST.
-    // Use SafeERC20 (token.safeTransfer). Emit Released.
-    // ------------------------------------------------------------
-    function release(uint256 id) external {
-        revert("TODO step 3");
+    /// @notice Send all currently releasable tokens to the beneficiary. Anyone may call it.
+    /// @dev Checks-Effects-Interactions: state is updated before the token transfer.
+    /// @param id Schedule id. Reverts if unknown or if nothing can be released.
+    function release(uint256 id) external nonReentrant {
+        Schedule storage s = schedules[id];
+        require(s.beneficiary != address(0), "unknown id");
+        uint256 amount = _vested(s) - s.released;
+        require(amount > 0, "nothing to release");
+
+        // Effects
+        s.released += amount;
+        totalAllocated -= amount;
+
+        // Interactions
+        token.safeTransfer(s.beneficiary, amount);
+        emit Released(id, s.beneficiary, amount);
     }
 
-    // ------------------------------------------------------------
-    // STEP 4 — revoke (owner only)
-    // Only for revocable, not yet revoked schedules.
-    // The UNVESTED part (total - vested now) goes back to the owner immediately.
-    // The already vested part stays claimable by the beneficiary via release().
-    // After revoking, vesting is frozen: set revoked = true, revokedAt = now.
-    // totalAllocated must drop by the returned amount. Emit Revoked.
-    // ------------------------------------------------------------
-    function revoke(uint256 id) external {
-        revert("TODO step 4");
+    /// @notice Revoke a schedule (owner only): the unvested part returns to the owner,
+    ///         the vested part stays claimable by the beneficiary. Vesting is frozen.
+    /// @param id Schedule id. Must be revocable and not yet revoked.
+    function revoke(uint256 id) external nonReentrant onlyOwner {
+        Schedule storage s = schedules[id];
+        require(s.beneficiary != address(0), "unknown id");
+        require(s.revocable, "not revocable");
+        require(!s.revoked, "already revoked");
+
+        uint256 unvested = s.total - _vested(s);
+
+        // Effects
+        s.revoked = true;
+        s.revokedAt = uint64(block.timestamp);
+        totalAllocated -= unvested;
+
+        // Interactions
+        if (unvested > 0) token.safeTransfer(owner(), unvested);
+        emit Revoked(id, unvested);
     }
 
-    // ------------------------------------------------------------
-    // STEP 5 — housekeeping
-    // withdrawUnallocated(to): owner only; sends balance - totalAllocated to `to`
-    //   (rescues tokens sent by mistake / returned by nobody). Reverts if the amount is 0.
-    // schedulesOf(beneficiary): ids of schedules currently owned by the address.
-    // ------------------------------------------------------------
-    function withdrawUnallocated(address to) external returns (uint256 amount) {
-        revert("TODO step 5");
+    /// @notice Withdraw tokens that are not promised to any schedule (owner only).
+    /// @param to Recipient of the unallocated tokens.
+    /// @return amount Number of tokens sent. Reverts if there is nothing to withdraw.
+    function withdrawUnallocated(address to) external nonReentrant onlyOwner returns (uint256 amount) {
+        require(to != address(0), "zero address");
+        uint256 bal = token.balanceOf(address(this));
+        require(bal > totalAllocated, "nothing to withdraw");
+        amount = bal - totalAllocated;
+        token.safeTransfer(to, amount);
     }
 
+    /// @notice Ids of the schedules currently owned by an address.
+    /// @param beneficiary The address to look up.
+    /// @return List of schedule ids.
     function schedulesOf(address beneficiary) external view returns (uint256[] memory) {
-        revert("TODO step 5");
+        return _schedulesOf[beneficiary];
     }
 
-    // ------------------------------------------------------------
-    // BONUS — a beneficiary can hand the schedule to another address
-    // Only the CURRENT beneficiary. New beneficiary != 0. Already released amount stays recorded.
-    // schedulesOf must reflect the change (old owner no longer lists it, new owner does).
-    // Emit ScheduleTransferred.
-    // ------------------------------------------------------------
+    /// @notice Hand a schedule over to another address (current beneficiary only).
+    /// @dev Already released amount stays recorded in the schedule.
+    /// @param id Schedule id.
+    /// @param newBeneficiary New owner of the schedule (must not be the zero address).
     function transferSchedule(uint256 id, address newBeneficiary) external {
-        revert("TODO bonus");
+        Schedule storage s = schedules[id];
+        require(msg.sender == s.beneficiary, "not beneficiary");
+        require(newBeneficiary != address(0), "zero address");
+
+        uint256[] storage list = _schedulesOf[msg.sender];
+        for (uint256 i = 0; i < list.length; i++) {
+            if (list[i] == id) {
+                list[i] = list[list.length - 1];
+                list.pop();
+                break;
+            }
+        }
+        s.beneficiary = newBeneficiary;
+        _schedulesOf[newBeneficiary].push(id);
+        emit ScheduleTransferred(id, msg.sender, newBeneficiary);
     }
 }
